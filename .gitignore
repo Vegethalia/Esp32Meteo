@@ -30,3 +30,4 @@
 *.exe
 *.out
 *.app
+Esp32Meteo/src/mykeys.h
