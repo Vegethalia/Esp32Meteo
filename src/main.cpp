@@ -1,298 +1,382 @@
-
+/*
 #include <Arduino.h>
+#include <Wire.h>
 #include <WiFiClientSecure.h>
-#include <WiFi.h>
 #include <PubSubClient.h>
-#include <U8g2lib.h>
+#include <vector>
+#include <memory>
+#include <ctime>
 #include <string>
-#include "modules/MyBME280.h"
-#include "mykeys.h"
+#include <NMEAGPS.h>
+#include <SoftwareSerial.h>
+#include "mykeys.h" //header containing sensitive information. Not included in repo. You will need to define the missing constants.
+#include "modules/ScreenDebugger.h"
+#include "types.h"
+#include "modules/Utils.h"
+
+
 
 #define PIN_I2C_SDA 21
 #define PIN_I2C_SCL 22
-#define PIN_LED_MIO 32
-#define PIN_BUTTON 4
-#define I2C_ADDRESS_BME280 0x76
-#define I2C_BUS_SPEED 100000 //100000, 400000
 
 #define SCREEN_WIDTH 128 // OLED display width, in pixels
 #define SCREEN_HEIGHT 64 // OLED display height, in pixels
 
 // ADAFRUIT Feeds / Related stuff
-#define ADAFRUIT_ADDR      "io.adafruit.com"
+#define ADAFRUIT_ADDR      "52.7.124.212" //"io.adafruit.com"
 #define ADAFRUIT_PORT      1883
 
-#define FEED_TEMPERATURE   "/feeds/temperatura"
-#define FEED_HUMIDITY      "/feeds/humitat"
-#define FEED_PRESSURE      "/feeds/pressio"
-#define FEED_TURN_ON_PWM   "/feeds/turnonled"
-#define FEED_INTENSITY_PWN "/feeds/ledintensity"
-#define FEED_LUX           "/feeds/lux"
+#define FEED_LOCATION      "/feeds/location/csv" //sensor_value,latitude,longitude,elevation
 
-#define PRESSURE_OFFSET 14 //looks like my sensor always returns the real pressure minus this offset
-#define DEBOUNCE_TIME 250 // Filtre anti-rebond (debouncer)
+//U8G2_SH1106_128X64_NONAME_2_HW_I2C u8g2(U8G2_R0, PIN_I2C_SCL, PIN_I2C_SDA);
+U8G2_SSD1306_128X64_NONAME_1_HW_I2C _u8g2(U8G2_R0, PIN_I2C_SCL, PIN_I2C_SDA);
 
-//GLOBAL OBJECTS
-WiFiClient _TheWifi;
-PubSubClient _ThePubSub;
-TwoWire _TheIc2Wire(0);
-MyBME280 _TheBME;
+#define PIN_LED 32
+#define GSMPIN_RX 19
+#define GSMPIN_TX 18
+#define CHECK_GPRS_EVERY_MS 20000
+#define MAX_GPRS_ERRORS 5 //after this errors, restart everything
 
-//-----FORWARD DECLARATIONS
-bool CheckWifi(); //Returns true if the Wifi Network is ready
-bool CheckMQTT(); //Returns true if MQTT connections are working
-bool UpdateValues(); //returns true if values were successfully read from BME280 sensor
-void PrintValuesOnScreen(int millis);
-void PubSubCallback(char *pTopic, uint8_t *pData, unsigned int dalaLength);
-//-----FORWARD DECLARATIONS
+// Range to attempt to autobaud
+#define GSM_AUTOBAUD_MIN 9600
+#define GSM_AUTOBAUD_MAX 38400 //57600
+#define TINY_GSM_MODEM_SIM800 // definição do modem usado (SIM800L)
+#include <TinyGsmClient.h>		// biblioteca com comandos GSM
 
-//SetUp SH1106 / SSD1306
-//U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, PIN_I2C_SCL, PIN_I2C_SDA); //R0 = no rotate
-U8G2_SSD1306_128X64_NONAME_2_HW_I2C u8g2(U8G2_R0, PIN_I2C_SCL, PIN_I2C_SDA);
+//HardwareSerial SerialGSM(2);
+SoftwareSerial  _SerialGSM(GSMPIN_RX, GSMPIN_TX); // objeto de comunicação serial do SIM800L
+TinyGsm         _modemGSM(_SerialGSM);
+TinyGsmClient   _clientGSM(_modemGSM);
 
-//VARIABLES
+HardwareSerial  _SerialGPS(2);
+TwoWire         _I2Cscreen = TwoWire(0);
+//WiFiClient      _TheWifi;
+PubSubClient    _ThePubSub;
+
+//ScreenDebugger  _TheDebug(&_u8g2, 5, 1);
+ScreenInfo      _TheScreenInfo;
+bool            _ScreenActive = true;
+
+NMEAGPS         _TheNeoGps; // This parses the GPS characters
+gps_fix         _TheFix;
+
+
+//TIMING VARS
 unsigned long _delayTimeUpt = 30000;
-unsigned long _delayTimeLoop = 50;
 unsigned long _lastProcessMillis = 0;
+unsigned long _LastFixed = 0;
+uint8_t       _GprsErrorCount=0;
+int           _timeout = 0;
 
-byte _lastClockChar = 0;
-uint16_t _totalUpdateTime = 0;	 //used to accomulate the screen update time between sensor readings
-uint16_t _numUpdates = 0;				 //number of updates accomulated on _totalUpdateTime
-uint16_t _lastAvgUpdateTime = 0; //_totalUpdateTime/_numUpdates of the last period
+//FORWARD DECLARATIONS
+void DrawScreen();
+//END FF DECLARATIONS
 
-//state vars
-bool _BlueLedON = false;
-bool _UpdateRequired = false;
-byte _BlueLedIntensity = 50; //default intensity
+//Envia comando AT e aguarda até que uma resposta seja obtida
+// String sendAT(String command)
+// {
+// 	String response = "";
+// 	_SerialGSM.println(command);
+// 	// aguardamos até que haja resposta do SIM800L
+// 	while(!_SerialGSM.available());
 
-volatile uint32_t _DebounceTimer = 0;
+// 	response = _SerialGSM.readString();
 
-void IRAM_ATTR ButtonPressed()
+// 	return response;
+// }
+
+void setupGSM()
 {
-	if (millis() - _DebounceTimer >= DEBOUNCE_TIME)
-	{
-		_DebounceTimer = millis();
-		Serial.println("INTERRUPTED BY BUTTON!!");
+	log_d("Setup GSM...");
 
-		int pinValue = digitalRead(PIN_BUTTON);
-		log_d("[%d] Pin value=%d", (int)millis(), pinValue);
+	// inicia serial SIM800L
+	//SerialGSM.begin(BAUD_RATE);//, SERIAL_8N1, RX_PIN, TX_PIN, false);
 
-		_BlueLedON = !_BlueLedON;
-		_UpdateRequired = true;
+			// Set GSM module baud rate
+	TinyGsmAutoBaud(_SerialGSM, GSM_AUTOBAUD_MIN, GSM_AUTOBAUD_MAX);
+	//delay(3000);
+
+	// // log_d("Modem NAME: %s", _modemGSM.getModemName().c_str());
+	// // log_d("Modem INFO: %s", _modemGSM.getModemInfo().c_str());
+	// // log_d("Modem IMEI: %s", _modemGSM.getIMEI().c_str());
+
+	// if(modemGSM.simUnlock("1234")) {
+	// 	Serial.println("SIM UNLOCKED");
+	// }
+	// else {
+	// 	Serial.println("SIM LOCKED");
+	// }
+
+	// // log_d("SignalQ: %d", _modemGSM.getSignalQuality());
+	// // log_d("SIM status: %s", _modemGSM.getSimStatus() ? "READY" : "LOCKED");
+	// log_d("COPS? --> [%s]", sendAT("AT+COPS=?").c_str());
+	// log_d("CREG? --> [%s]", sendAT("AT+CREG?").c_str());
+	// log_d("CBAND? --> [%s]", sendAT("AT+CBAND=?").c_str());
+
+	//aguarda network
+	_TheScreenInfo.wifiState = "Connecting...";
+	DrawScreen();
+
+	if(!_modemGSM.waitForNetwork(20000)) {
+		log_d("Failed to connect to network");
+		if(!_modemGSM.restart()) {
+			log_d("Restarting GSM\nModem failed");
+		}
+		else {
+			log_d("GSM Modem restarted");
+		}
+		ESP.restart();
+		return;
 	}
+	log_d("Modem registered to network OK!!");
+	_TheScreenInfo.wifiState = "Network OK";
+	DrawScreen();
+
+	//conecta na rede (tecnologia GPRS)
+	if(!_modemGSM.gprsConnect("internetmas")) {
+		log_d("GPRS Connection Failed :(");
+		_TheScreenInfo.wifiState = "GPRS Error";
+		DrawScreen();
+		delay(1000);
+		ESP.restart();
+		return;
+	}
+	_TheScreenInfo.wifiState = "GPRS OK";
+	log_d("GPRS Connected OK!!");
+	DrawScreen();
+}
+
+// verifica se o SIM800L se desconectou, se sim tenta reconectar
+bool verifyGPRSConnection()
+{
+	bool result = false;
+
+	if(_modemGSM.isGprsConnected()) {
+		result = true;
+		log_d("GPRS: Connected!");
+		_TheScreenInfo.wifiConnected=true;
+		_TheScreenInfo.wifiState = "GPRS OK";
+	}
+	else {
+		log_d("GPRS: Disconnected. Reconnecting...");
+		_TheScreenInfo.wifiConnected = false;
+
+		if(!_modemGSM.waitForNetwork()) {
+			log_d("Network Failed");
+			_modemGSM.restart();
+			_TheScreenInfo.wifiState = "Net Error";
+		}
+		else {
+			if(!_modemGSM.gprsConnect(APN)) {
+				log_d("GPRS Failed");
+				_TheScreenInfo.wifiState = "GPRS Error";
+			}
+			else {
+				result = true;
+				log_d("GPRS Connection OK");
+				_TheScreenInfo.wifiConnected = true;
+				_TheScreenInfo.wifiState = "GPRS OK";
+			}
+		}
+	}
+	return result;
+}
+
+bool verifyMqttConnection()
+{
+	bool ret=true;
+
+	if(!_ThePubSub.connected()) {
+		_TheScreenInfo.mqttConnected = false;
+		log_d("PubSubClient Not Connected :(");
+
+		_ThePubSub.setClient(_clientGSM);//_TheWifi);
+		_ThePubSub.setServer(ADAFRUIT_ADDR, ADAFRUIT_PORT);
+		_ThePubSub.setKeepAlive(60);
+		//_ThePubSub.setCallback(PubSubCallback);
+		if(!_ThePubSub.connect("PChanMQTT", ADAIO_USER, ADAIO_KEY)) {
+			log_d("ERROR!! PubSubClient was not able to connect to AdafruitIO!!");
+			//_TheDebug.NewLine("MQTT error :(");
+			_TheScreenInfo.mqttState = Utils::string_format("Error. State=%d", _ThePubSub.state());
+			ret = false;
+		}
+		else {
+			_TheScreenInfo.mqttConnected = true;
+			_TheScreenInfo.mqttState = "Connected";
+			log_d("PubSubClient connected to AdafruitIO!!");
+			//_TheDebug.NewLine("MQTT OK!!");
+		}
+	}
+	else {
+		_TheScreenInfo.mqttConnected = true;
+		_TheScreenInfo.mqttState = "Connected";
+	}
+
+	return ret;
 }
 
 void setup()
 {
-	// put your setup code here, to run once:
 	Serial.begin(115200);
-	pinMode(PIN_LED_MIO, OUTPUT);
-	pinMode(PIN_BUTTON, INPUT);
-
 	// wait for serial monitor to open
-	while (!Serial);
+	while(!Serial);
 
-	//Initialize I2C bus
-	log_d("Initializing i2c sda=%d scl=%d speed=%dkhz", PIN_I2C_SDA, PIN_I2C_SCL, I2C_BUS_SPEED / 1000);
-	if (!_TheIc2Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL, I2C_BUS_SPEED)) { //busspeed=0 => default 100000
-		log_d("i2c initialization failed...");
-		delay(2000);
-		ESP.restart();
-	}
-	//Initialize BME280
-	if(_TheBME.Init(I2C_ADDRESS_BME280, _TheIc2Wire, 20000)!=MyBME280::ERROR::OK) {
-		log_d("Could not find a valid BME280 sensor, check wiring!");
-		delay(2000);
-		ESP.restart();
-	}
-	_TheBME.SetPressureOffset(PRESSURE_OFFSET);
+	log_d("Setup GPS...");
+	_SerialGPS.begin(9600);
+
+	pinMode(PIN_LED, OUTPUT);
+
+	_I2Cscreen.begin(PIN_I2C_SDA, PIN_I2C_SCL, 100000); //0=default 100000 100khz
 
 	log_d("Begin Display...");
-	u8g2.setBusClock(I2C_BUS_SPEED);
-	//	u8g2.beginSimple();// does not clear the display and does not wake up the display  user is responsible for calling clearDisplay() and setPowerSave(0)
-	u8g2.begin();
-	u8g2.enableUTF8Print();							 // enable UTF8 support for the Arduino print()
-	u8g2.setContrast(_BlueLedIntensity); //set default contrast
-																			 //	PrintValuesOnScreen(_delayTimeUpt); //Print 1st values
+	_u8g2.setBusClock(100000);
+	_u8g2.begin();
+	_u8g2.setFont(u8g2_font_5x8_mf);
+	//_TheDebug.SetFont(ScreenDebugger::SIZE1);
+	DrawScreen();
 
 	//Initialize Wifi
-	wl_status_t statuswf = WiFi.begin(WIFI_SSID, WIFI_PASS);
-	if (statuswf != WL_CONNECTED)	{
-		log_d("Couldn't get a wifi connection!");
-	}
-	else {
-		log_d("Connected to wifi [%s]", WIFI_SSID);
-	}
-	
-	//configure interrupts for buttons
-	attachInterrupt(PIN_BUTTON, ButtonPressed, RISING);
+	//_TheDebug.NewLine("Initializing WiFi...");
+	log_d("Initializing WiFi...");
+	// inicia e configura o SIM800L
+	setupGSM();
 
-	//Initial Read
-	_TheBME.ReadSensor();
+// 	WiFi.setAutoReconnect(true);
+// 	//WiFi.config(_LocalIP, _GWIP, _MaskIP, _DNS1);
+// 	wl_status_t statuswf = WiFi.begin(WIFI_SSID, WIFI_PASS);
+// 	WiFi.waitForConnectResult();
+// 	if(statuswf != WL_CONNECTED) {
+// 		_TheScreenInfo.wifiState = "Connecting...";
+// 		//_TheDebug.NewLine("NOT CONNECTED :(");
+// 		log_d("NOT CONNECTED :(");
+// 	}
+// 	else {
+// //		WiFi.config(WiFi.localIP(), WiFi.gatewayIP(), WiFi.subnetMask(), IPAddress(8, 8, 8, 8));
+// 		_TheScreenInfo.wifiState = WiFi.localIP().toString().c_str();
+// 		// _TheDebug.NewLine("WIFI CONNECTED!!");
+// 		// _TheDebug.NewLine(WiFi.localIP().toString().c_str());
+// 		log_d("CONNECTED! IP=[%s]", WiFi.localIP().toString().c_str());
+// 	}
+
+//	_TheDebug.NewLine("Setup Complete!");
+	log_d("Setup Complete!");
+}
+
+void DrawScreen()
+{
+	if(!_ScreenActive) {
+		return;
+	}
+
+	uint16_t charH = _u8g2.getMaxCharHeight() == 0 ? 10 : _u8g2.getMaxCharHeight();
+	//uint16_t maxHeight = _u8g2.getHeight();
+	uint16_t j = charH;
+
+	std::tm* ptm = std::localtime(&_TheScreenInfo.gps_time);
+	char tbuffer[32];
+	std::strftime(tbuffer, sizeof(tbuffer), "%d/%m/%Y %H:%M:%S", ptm);
+
+	_u8g2.firstPage();
+	do {
+		j = charH;
+		_u8g2.setCursor(0, j); j += charH * 2;
+		if(_TheScreenInfo.gpsFix) {
+			_u8g2.print("GPS: F I X E D");
+		}
+		else {
+			_u8g2.print("GPS: Locating...");
+		}
+		_u8g2.setCursor(0, j); j += charH;
+		_u8g2.print(Utils::string_format("Lat/Lon: (%3.3f, %3.3f)", _TheScreenInfo.lat_deg, _TheScreenInfo.lon_deg).c_str());
+		_u8g2.setCursor(0, j); j += charH;
+		_u8g2.print(Utils::string_format("Alt: %3.1fm Spd: %3.1fkph", _TheScreenInfo.alt_m, _TheScreenInfo.speed_kph).c_str());
+		_u8g2.setCursor(0, j); j += charH;
+		_u8g2.print(Utils::string_format("Wifi: %s", _TheScreenInfo.wifiState.c_str()).c_str());
+		_u8g2.setCursor(0, j); j += charH * 2;
+		_u8g2.print(Utils::string_format("Mqtt: %s", _TheScreenInfo.mqttState.c_str()).c_str());
+		_u8g2.setCursor(0, j); j += charH;
+		_u8g2.print(Utils::string_format("Time: %s", tbuffer).c_str());
+
+	} while(_u8g2.nextPage());
 }
 
 void loop()
 {
 	auto now = millis();
+	if(_TheScreenInfo.gpsFix && (now - _LastFixed) > 60000) {
+		_TheScreenInfo.gpsFix = false;
+	}
 
-	if ((now - _lastProcessMillis) >= _delayTimeUpt) {
-		_lastProcessMillis=now;
-		digitalWrite(PIN_LED_MIO, HIGH); // turn on the "updating LED"
-		delay(200);
-		digitalWrite(PIN_LED_MIO, LOW); // turn off the "updating LED"
+	// while(_SerialGPS.available()) {
+	// 	Serial.println(_SerialGPS.readStringUntil('\n'));
+	// }
 
-		if (_TheBME.ReadSensor() == MyBME280::ERROR::OK && CheckWifi() && CheckMQTT()) {
-			_ThePubSub.publish((std::string(ADAIO_USER).append(FEED_TEMPERATURE)).c_str(), String(_TheBME.GetLatestTemperature()).c_str());
-			_ThePubSub.publish((std::string(ADAIO_USER).append(FEED_HUMIDITY)).c_str(), String(_TheBME.GetLatestHumidity()).c_str());
-			_ThePubSub.publish((std::string(ADAIO_USER).append(FEED_PRESSURE)).c_str(), String(_TheBME.GetLatestPressure()).c_str());
+
+	while(_TheNeoGps.available(_SerialGPS)) {
+		_TheFix = _TheNeoGps.read();
+		if(_TheFix.valid.location) {
+			_LastFixed = now;
+			_TheScreenInfo.gpsFix = true;
+			_TheScreenInfo.lat_deg = _TheFix.latitude();
+			_TheScreenInfo.lon_deg = _TheFix.longitude();
+			//snprintf(buff, sizeof(buff), " Fix! (%3.2f,%3.2f) ", _TheFix.latitude(), _TheFix.longitude());
+			//_TheDebug.NewLine(buff);
+			// snprintf(buff, sizeof(buff), "Alt=%d Sp=%3.2f", _TheFix.altitude_cm(), _TheFix.speed_kph());
+			// _TheDebug.NewLine(buff);
 		}
-	}
-	if (_UpdateRequired) {
-		if (_BlueLedON)
-		{ //turn on screen
-			u8g2.setPowerSave(0);
-			u8g2.setContrast(_BlueLedIntensity);
+		if(_TheFix.valid.speed) {
+			_TheScreenInfo.speed_kph = _TheFix.speed_kph();
 		}
-		else
-		{ //turn off screen
-			u8g2.setPowerSave(1);
+		if(_TheFix.valid.altitude) {
+			_TheScreenInfo.alt_m = _TheFix.altitude();
 		}
-	}
-	if (_BlueLedON)	{
-		PrintValuesOnScreen(_delayTimeUpt - (now - _lastProcessMillis));
-	}
-
-	if (_ThePubSub.connected())	{
-		_ThePubSub.loop(); //allow the pubsubclient to process incoming messages
-	}
-
-	delay(_delayTimeLoop);
-}
-
-bool CheckWifi()
-{
-	if (!WiFi.isConnected()) {
-		log_d("Reconnecting to Wifi...");
-		WiFi.reconnect();
-	}
-	if (WiFi.status() != WL_CONNECTED) {
-		log_d("Couldn't get a wifi connection!");
-		return false;
-	}
-	return true;
-}
-
-bool CheckMQTT()
-{
-	if (!_ThePubSub.connected()) {
-		_ThePubSub.setClient(_TheWifi);
-		_ThePubSub.setServer(ADAFRUIT_ADDR, ADAFRUIT_PORT);
-		_ThePubSub.setCallback(PubSubCallback);
-		if (!_ThePubSub.connect("PChanMQTT", ADAIO_USER, ADAIO_KEY)) {
-			log_d("ERROR!! PubSubClient was not able to connect to AdafruitIO!!");
-			return false;
+		if(_TheFix.valid.date && _TheFix.valid.time) {
+			_TheScreenInfo.gps_time = (NeoGPS::clock_t)_TheFix.dateTime;
 		}
-		else	{ //Subscribe to the on/off button and the slider
-			log_d("PubSubClient connected to AdafruitIO!!");
-			if (!_ThePubSub.subscribe((std::string(ADAIO_USER).append(FEED_TURN_ON_PWM)).c_str())) {
-				log_d("ERROR!! PubSubClient was not able to suibscribe to [%s]", FEED_TURN_ON_PWM);
+		// else {
+		// 	_TheScreenInfo.gpsFix=false;
+		// 	//_TheDebug.NewLine("Not Fixed :(");
+		// }
+	}
+	if(!_TheFix.valid.location) {
+		_TheScreenInfo.gpsFix=false;
+	}
+
+	if(_TheFix.valid.location && (now - _lastProcessMillis) >= _delayTimeUpt) {
+		_lastProcessMillis = now;
+		log_d("Time 2 update!!");
+
+		if(_TheFix.valid.location) {
+			if(verifyGPRSConnection() && verifyMqttConnection()) {
+				std::string msg = Utils::string_format("%f, %f, %f, %d", _TheFix.speed_kph(), _TheFix.latitude(), _TheFix.longitude(), _TheFix.altitude_cm() / 100);
+				log_d("Publishing [%s]", msg.c_str());
+				if(_ThePubSub.publish((std::string(ADAIO_USER).append(FEED_LOCATION)).c_str(), msg.c_str())) {
+					_TheScreenInfo.mqttState = Utils::string_format("(%3.2f,%3.2f)", _TheFix.latitude(), _TheFix.longitude());
+				}
+				else {
+					_TheScreenInfo.mqttState = "Publish Error";
+				}
 			}
-			if (!_ThePubSub.subscribe((std::string(ADAIO_USER).append(FEED_INTENSITY_PWN)).c_str())) {
-				log_d("ERROR!! PubSubClient was not able to suibscribe to [%s]", FEED_INTENSITY_PWN);
+			else {
+				log_d("GPRS Not Ready :(");
+				_GprsErrorCount++;
+				if(_GprsErrorCount>=MAX_GPRS_ERRORS) {
+					_GprsErrorCount = 0;
+					_TheScreenInfo.wifiState="RESET";
+					DrawScreen();
+					_modemGSM.restart();
+					ESP.restart();
+				}
 			}
-		}
-	}
-	return true;
-}
-
-void PubSubCallback(char *pTopic, uint8_t *pData, unsigned int dataLenght)
-{
-	std::string theTopic(pTopic);
-	std::string theMsg;
-
-	for (uint16_t i = 0; i < dataLenght; i++)	{
-		theMsg.push_back((char)pData[i]);
-	}
-	log_d("Received message from [%s]: [%s]", theTopic.c_str(), theMsg.c_str());
-
-	if (theTopic.find(FEED_TURN_ON_PWM) != std::string::npos)	{
-		if (theMsg == "ON")	{
-			log_d("Turning on the screen!, intensity=%d", _BlueLedIntensity);
-			_BlueLedON = true;
 		}
 		else {
-			log_d("Turning off the screen...");
-			_BlueLedON = false;
+			log_d("Not valid location :(");
 		}
 	}
-	else if (theTopic.find(FEED_INTENSITY_PWN) != std::string::npos) {
-		auto intensity = std::atoi(theMsg.c_str());
-		log_d("Changing screen intensity=%d", intensity);
-		_BlueLedIntensity = intensity;
+	if(_ThePubSub.connected()) {
+		_ThePubSub.loop(); //allow the pubsubclient to process incoming messages
 	}
+	DrawScreen();
+
 }
-
-void PrintValuesOnScreen(int millisPending)
-{
-	char buffer[128];
-	char c = '-';
-	int8_t fh = 10, h;
-	int printTime = millis();
-
-	switch (_lastClockChar)
-	{
-	case 0:
-		c = '\\';
-		break;
-	case 1:
-		c = '|';
-		break;
-	case 2:
-		c = '/';
-		break;
-	case 3:
-		c = '-';
-		break;
-	}
-	_lastClockChar = (_lastClockChar + 1) % 4;
-
-	if (_lastAvgUpdateTime == 0 && _numUpdates)
-	{
-		_lastAvgUpdateTime = _totalUpdateTime / _numUpdates;
-	}
-
-	u8g2.firstPage();
-	do
-	{
-		//u8g2.clearBuffer();
-		u8g2.setFont(u8g2_font_sirclivethebold_tr); //7 pixels
-		snprintf(buffer, sizeof(buffer), "Valors Actuals");
-		//		auto strwidth=u8g2.getStrWidth(buffer);
-		//u8g2.setCursor((SCREEN_WIDTH-strwidth)/2, h);
-		u8g2.setCursor(0, fh);
-		u8g2.print(buffer);
-
-		u8g2.setFont(u8g2_font_profont11_mf); 
-		h = fh * 2.4;
-		u8g2.setCursor(5, h);
-		snprintf(buffer, sizeof(buffer), "%-11s:[%2.1fºC]", "Temperatura", _TheBME.GetLatestTemperature());
-		u8g2.print(buffer);
-		h += fh * 1.4;
-		snprintf(buffer, sizeof(buffer), "%-11s:[%d%%]", "Humitat", (int)_TheBME.GetLatestHumidity());
-		u8g2.setCursor(5, h);
-		u8g2.print(buffer);
-		h += fh * 1.4;
-		snprintf(buffer, sizeof(buffer), "%-12s:[%dhPa]", "Pressió", (int)_TheBME.GetLatestPressure());
-		u8g2.setCursor(5, h);
-		u8g2.print(buffer);
-
-		u8g2.setFont(u8g2_font_profont10_mf); //6 pixels monospace
-		snprintf(buffer, sizeof(buffer), "%c %2ds %c     [%3dms]", c, millisPending / 1000, c, _lastAvgUpdateTime);
-		u8g2.drawStr(15, 64, buffer);
-	} while (u8g2.nextPage());
-	//u8g2.sendBuffer();
-
-	//log_d("Updated Screen in [%dms]...",  millis()-printTime);
-	_numUpdates++;
-	_totalUpdateTime += (millis() - printTime);
-}
+*/
